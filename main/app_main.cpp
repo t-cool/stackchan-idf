@@ -16,6 +16,7 @@
 #include "servo_task.hpp"
 #include "shared_state.hpp"
 #include "speech.hpp"
+#include "wifi_provisioning.hpp"
 
 namespace {
 
@@ -117,6 +118,11 @@ void demo_loop()
     // the previous balloon finished. Atomics keep it thread-safe.
     static std::atomic<bool> balloon_in_flight{false};
 
+    // Wi-Fi state edge detection: while disconnected we pin a persistent
+    // "Wi-Fi: 切断中" balloon and suppress babble; when it reconnects we
+    // clear the balloon so normal demo behaviour resumes.
+    bool wifi_warning_active = false;
+
     for (;;) {
         // Drive M5.update() so M5.Touch / M5.BtnPWR latch their state machines.
         M5.update();
@@ -125,6 +131,19 @@ void demo_loop()
 
         // Mouth opens with the current speech envelope; closed while silent.
         g_state->mouth_open.store(speech.current_mouth_open(), std::memory_order_relaxed);
+
+        const bool wifi_ok = app::wifi_is_connected();
+        if (!wifi_ok && !wifi_warning_active) {
+            speech.stop();
+            // hold_ms = UINT32_MAX so the balloon stays put until we clear it.
+            g_state->set_balloon_text("Wi-Fi: 切断中", /*hold_ms=*/UINT32_MAX);
+            balloon_in_flight.store(false, std::memory_order_release);
+            wifi_warning_active = true;
+        } else if (wifi_ok && wifi_warning_active) {
+            g_state->clear_balloon();
+            wifi_warning_active = false;
+            next_speech_ms = now_ms + 1500;
+        }
 
         // Tap-to-record: any single-finger click cancels current babble and
         // runs a 10-second AAC record + playback. Blocks demo_loop for ~20 s
@@ -145,8 +164,10 @@ void demo_loop()
 
         // Kick off a new babble + balloon once the previous balloon is done
         // (callback resets balloon_in_flight) AND audio is idle AND the random
-        // dwell time has elapsed.
-        if (now_ms >= next_speech_ms &&
+        // dwell time has elapsed. Suppressed while Wi-Fi is down so the
+        // disconnected balloon stays visible.
+        if (!wifi_warning_active &&
+            now_ms >= next_speech_ms &&
             !speech.is_speaking() &&
             !balloon_in_flight.load(std::memory_order_acquire)) {
             speech.babble(now_ms);
@@ -206,6 +227,12 @@ extern "C" void app_main()
     }
     M5.Speaker.end();
     vTaskDelay(pdMS_TO_TICKS(20));
+
+    // Wi-Fi: reconnect with stored credentials, or run interactive BLE
+    // provisioning. Returns as soon as the driver is started — actual
+    // association happens in the background and is surfaced via the
+    // balloon ("Wi-Fi: 切断中") in demo_loop.
+    stackchan::app::wifi_connect_or_provision(board.display());
 
     // Mic / loopback sanity check at startup.
     record_and_playback(2, "mic test");

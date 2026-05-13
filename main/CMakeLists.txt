@@ -5,6 +5,7 @@ idf_component_register(
         "render_task.cpp"
         "servo_task.cpp"
         "speech.cpp"
+        "wifi_provisioning.cpp"
     INCLUDE_DIRS "."
     PRIV_REQUIRES
         board
@@ -14,5 +15,12 @@ idf_component_register(
         M5GFX
         esp_timer
         driver
+        nvs_flash
+        esp_wifi
+        esp_netif
+        esp_event
+        bt
+        wifi_provisioning
+        protocomm
 )
 target_compile_features(${COMPONENT_LIB} PRIVATE cxx_std_20)
