@@ -6,6 +6,6 @@
 
 namespace stackchan::avatar::internal {
 
-void draw_balloon(M5Canvas& canvas, const DrawContext& ctx);
+void draw_balloon(M5Canvas& canvas, DrawContext& ctx);
 
 } // namespace stackchan::avatar::internal

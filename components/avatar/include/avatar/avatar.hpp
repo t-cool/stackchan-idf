@@ -28,8 +28,15 @@ public:
     void set_mouth_open(float ratio) noexcept;
     void set_gaze(float horizontal, float vertical) noexcept;
     void set_palette(const Palette& palette) noexcept;
-    void set_balloon_text(std::string_view text);
+    // Show `text` in the balloon. `hold_ms` overrides the default display
+    // time (0 = use balloon defaults: short text holds for a few seconds,
+    // long text plays one full marquee pass).
+    void set_balloon_text(std::string_view text, std::uint32_t hold_ms = 0);
     void clear_balloon() noexcept;
+    // True once the current balloon has been fully displayed (hold elapsed
+    // or one marquee pass completed). Stays true until the next
+    // set_balloon_text / clear_balloon.
+    bool is_balloon_done() const noexcept;
 
     // Drives animators with the current time in milliseconds and renders one frame.
     void tick(std::uint32_t now_ms);

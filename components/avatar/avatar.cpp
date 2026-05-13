@@ -38,6 +38,7 @@ public:
     void tick(std::uint32_t now_ms)
     {
         animator_.tick(now_ms, context_);
+        context_.now_ms = now_ms;
 
         canvas_.fillScreen(context_.palette.background);
         internal::draw_face(canvas_, face_, context_);
@@ -92,14 +93,28 @@ void Avatar::set_palette(const Palette& palette) noexcept
     impl_->context().palette = palette;
 }
 
-void Avatar::set_balloon_text(std::string_view text)
+void Avatar::set_balloon_text(std::string_view text, std::uint32_t hold_ms)
 {
-    impl_->context().balloon_text = std::string{text};
+    auto& ctx = impl_->context();
+    ctx.balloon_text = std::string{text};
+    ctx.balloon_hold_ms = hold_ms;
+    ctx.balloon_done = false;
+    // Resync marquee phase to "now" so a fresh string always enters from the
+    // right edge. context_.now_ms was last updated by tick().
+    ctx.balloon_set_ms = ctx.now_ms;
 }
 
 void Avatar::clear_balloon() noexcept
 {
-    impl_->context().balloon_text.reset();
+    auto& ctx = impl_->context();
+    ctx.balloon_text.reset();
+    ctx.balloon_hold_ms = 0;
+    ctx.balloon_done = false;
+}
+
+bool Avatar::is_balloon_done() const noexcept
+{
+    return impl_->context().balloon_done;
 }
 
 void Avatar::tick(std::uint32_t now_ms)
