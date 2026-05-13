@@ -9,6 +9,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+#include "audio_codec.hpp"
 #include "avatar/expression.hpp"
 #include "board/board.hpp"
 #include "render_task.hpp"
@@ -126,15 +127,17 @@ void demo_loop()
         g_state->mouth_open.store(speech.current_mouth_open(), std::memory_order_relaxed);
 
         // Tap-to-record: any single-finger click cancels current babble and
-        // runs one 2-second record + playback. Blocks demo_loop for ~4 s but
-        // the render task keeps animating.
+        // runs a 10-second AAC record + playback. Blocks demo_loop for ~20 s
+        // but the render task keeps animating.
         if (M5.Touch.getDetail(0).wasClicked()) {
             speech.stop();
-            g_state->set_balloon_text("Recording...", /*hold_ms=*/UINT32_MAX);
-            record_and_playback(2, "tap");
+            g_state->set_balloon_text("Recording 10s...", /*hold_ms=*/UINT32_MAX);
+            app::AacRecording rec;
+            if (app::record_aac(10, rec)) {
+                g_state->set_balloon_text("Playing AAC...", /*hold_ms=*/UINT32_MAX);
+                app::play_aac(rec);
+            }
             g_state->clear_balloon();
-            // Skip the random babble briefly so the user can hear the
-            // playback without it being interrupted by a babble kicking in.
             next_speech_ms = now_ms + 1500;
             balloon_in_flight.store(false, std::memory_order_release);
             continue;

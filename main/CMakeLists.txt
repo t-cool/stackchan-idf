@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "app_main.cpp"
+        "audio_codec.cpp"
         "render_task.cpp"
         "servo_task.cpp"
         "speech.cpp"
