@@ -21,6 +21,7 @@
 #include <freertos/task.h>
 
 #include "avatar/expression.hpp"
+#include "board/si12t_touch.hpp"
 #include "conversation/openai_realtime_client.hpp"
 #include "wifi_provisioning.hpp"
 
@@ -49,6 +50,11 @@ constexpr std::uint32_t kEnvelopeStepMs = 16;
 constexpr std::size_t kSegmentSamples = 4096;  // ~512 ms per segment at 8 kHz
 constexpr std::size_t kSegmentBuffers = 3;
 constexpr int kSpeakerChannel = 0;
+
+// Streaming playback: start speaking once this much reply audio has been
+// buffered, rather than waiting for the whole reply. Jitter margin against
+// network hiccups (the wire delivers µ-law faster than realtime).
+constexpr std::size_t kJitterBufferSamples = kSpeakerSampleRate * 300 / 1000; // ~300 ms
 
 // Mic / speaker I2S handoff settle time (matches the existing audio code).
 constexpr TickType_t kI2sSettle = pdMS_TO_TICKS(20);
@@ -115,8 +121,8 @@ std::uint32_t now_ms()
 // Owns the conversation; one instance per task.
 class Coordinator {
 public:
-    Coordinator(SharedState& state, const char* api_key)
-        : state_{state}, api_key_{api_key != nullptr ? api_key : ""}
+    Coordinator(SharedState& state, const char* api_key, board::Si12tTouch* touch)
+        : state_{state}, api_key_{api_key != nullptr ? api_key : ""}, touch_{touch}
     {
     }
 
@@ -254,12 +260,21 @@ private:
         }
     }
 
-    // Stream the PSRAM reply out through the internal-RAM segment ring. Feed
-    // M5.Speaker while it has a free slot (it keeps a 2-deep queue); copying a
-    // segment is a fast bulk memcpy, unlike the speaker's sample-by-sample
-    // resampler read. Non-blocking so mouth-sync keeps ticking.
+    // Stream the reply out through the internal-RAM segment ring. assistant_pcm_
+    // may still be growing (streaming playback) — feed M5.Speaker while it has
+    // a free slot (2-deep queue) and unplayed samples exist. Copying a segment
+    // is a fast bulk memcpy, unlike the speaker's sample-by-sample resampler
+    // read. Non-blocking so mouth-sync and barge-in polling keep ticking.
     void service_playback()
     {
+        // Barge-in: a touch on the head stops the reply and returns to
+        // listening. (The mic is physically off while speaking, so this is the
+        // only way to interrupt on the half-duplex CoreS3 hardware.)
+        if (touch_ != nullptr && touch_->read().any_touched()) {
+            barge_in();
+            return;
+        }
+
         while (seg_pos_ < assistant_pcm_.size() &&
                M5.Speaker.isPlaying(kSpeakerChannel) < kSegmentBuffers - 1) {
             const std::size_t n = std::min(kSegmentSamples, assistant_pcm_.size() - seg_pos_);
@@ -272,11 +287,23 @@ private:
 
         update_mouth();
 
-        if (seg_pos_ >= assistant_pcm_.size() && M5.Speaker.isPlaying(kSpeakerChannel) == 0) {
+        // Done only once every chunk has arrived, every sample has been queued,
+        // and the speaker has physically drained.
+        if (audio_complete_ && seg_pos_ >= assistant_pcm_.size() &&
+            M5.Speaker.isPlaying(kSpeakerChannel) == 0) {
             finish_speaking();
         } else {
             vTaskDelay(pdMS_TO_TICKS(10));
         }
+    }
+
+    void barge_in()
+    {
+        ESP_LOGI(kTag, "barge-in: user touched the head, interrupting reply");
+        M5.Speaker.stop();
+        (void)client_->cancel_response();
+        state_.set_balloon_text("はいはい？", /*hold_ms=*/1500);
+        enter_listening();
     }
 
     // Double-buffered mic streaming. M5.Mic keeps a 2-deep queue; when one
@@ -299,7 +326,11 @@ private:
         vTaskDelay(kI2sSettle);
         state_.mouth_open.store(0.0f, std::memory_order_relaxed);
         assistant_pcm_.clear();
+        // Reserve ahead so the streaming-playback inserts don't keep
+        // reallocating the PSRAM buffer as the reply grows.
+        assistant_pcm_.reserve(kSpeakerSampleRate * 20); // ~20 s headroom
         assistant_text_.clear();
+        audio_complete_ = false;
         // Prime the 2-deep mic queue.
         M5.Mic.record(mic_buf_[0].data(), mic_buf_[0].size(), kMicSampleRate, /*stereo=*/false);
         M5.Mic.record(mic_buf_[1].data(), mic_buf_[1].size(), kMicSampleRate, /*stereo=*/false);
@@ -307,48 +338,37 @@ private:
         local_ = Local::Listening;
     }
 
+    // Switch the I2S bus to the speaker and begin streaming playback. Called
+    // as soon as the jitter buffer fills (or on AssistantAudioDone for replies
+    // shorter than the jitter buffer) — assistant_pcm_ may still be growing.
     void start_speaking()
     {
         M5.Mic.end();
         vTaskDelay(kI2sSettle);
-
-        // Re-derive a 16 ms-window peak envelope so the avatar mouth tracks
-        // the streamed reply (same approach as Speech::current_mouth_open).
-        const std::size_t window = kSpeakerSampleRate * kEnvelopeStepMs / 1000u;
-        const std::size_t windows = (assistant_pcm_.size() + window - 1) / std::max<std::size_t>(window, 1);
-        envelope_.assign(windows, 0.0f);
-        for (std::size_t w = 0; w < windows; ++w) {
-            const std::size_t begin = w * window;
-            const std::size_t end = std::min(begin + window, assistant_pcm_.size());
-            std::int32_t peak = 0;
-            for (std::size_t i = begin; i < end; ++i) {
-                peak = std::max(peak, std::abs(static_cast<std::int32_t>(assistant_pcm_[i])));
-            }
-            envelope_[w] = static_cast<float>(peak) / 32767.0f;
-        }
-
-        playback_start_ms_ = now_ms();
-        playback_duration_ms_ =
-            static_cast<std::uint32_t>(static_cast<std::uint64_t>(assistant_pcm_.size()) * 1000u / kSpeakerSampleRate);
-
-        // The reply stays in PSRAM; service_state() streams it out segment by
-        // segment through the internal-RAM ring so the speaker never reads
-        // PSRAM directly. Playback itself starts on the next service tick.
         seg_pos_ = 0;
         seg_next_ = 0;
+        playback_start_ms_ = now_ms();
         local_ = Local::Speaking;
-        ESP_LOGI(kTag, "speaking %u ms of reply", static_cast<unsigned>(playback_duration_ms_));
+        ESP_LOGI(kTag, "speaking (streaming)");
     }
 
+    // Mouth-open is derived on the fly from the 16 ms window of reply audio
+    // currently being played — no precomputed envelope, so it works while
+    // assistant_pcm_ is still being streamed in.
     void update_mouth()
     {
+        const std::size_t window = kSpeakerSampleRate * kEnvelopeStepMs / 1000u;
         const std::uint32_t elapsed = now_ms() - playback_start_ms_;
-        if (elapsed >= playback_duration_ms_ || envelope_.empty()) {
+        const std::size_t begin = (elapsed / kEnvelopeStepMs) * window;
+        if (begin + window > assistant_pcm_.size()) {
             state_.mouth_open.store(0.0f, std::memory_order_relaxed);
             return;
         }
-        const std::size_t idx = elapsed / kEnvelopeStepMs;
-        state_.mouth_open.store(idx < envelope_.size() ? envelope_[idx] : 0.0f, std::memory_order_relaxed);
+        std::int32_t peak = 0;
+        for (std::size_t i = begin; i < begin + window; ++i) {
+            peak = std::max(peak, std::abs(static_cast<std::int32_t>(assistant_pcm_[i])));
+        }
+        state_.mouth_open.store(static_cast<float>(peak) / 32767.0f, std::memory_order_relaxed);
     }
 
     void finish_speaking()
@@ -410,13 +430,23 @@ private:
             break;
 
         case conv::ConversationEventType::AssistantAudioChunk:
-            if (ev.audio) {
+            // Ignore late chunks for a turn we already abandoned (barge-in).
+            if (ev.audio && (local_ == Local::Thinking || local_ == Local::Speaking)) {
                 assistant_pcm_.insert(assistant_pcm_.end(), ev.audio->begin(), ev.audio->end());
+                // Streaming: start playback as soon as the jitter buffer fills,
+                // rather than waiting for the whole reply.
+                if (local_ == Local::Thinking && assistant_pcm_.size() >= kJitterBufferSamples) {
+                    tool_pending_ = false;
+                    start_speaking();
+                }
             }
             break;
 
         case conv::ConversationEventType::AssistantAudioDone:
-            if (!assistant_pcm_.empty() && local_ != Local::Speaking) {
+            audio_complete_ = true;
+            // Reply shorter than the jitter buffer — it never tripped the
+            // streaming start, so begin playback now.
+            if (local_ == Local::Thinking && !assistant_pcm_.empty()) {
                 tool_pending_ = false;
                 start_speaking();
             }
@@ -441,11 +471,22 @@ private:
             }
             break;
 
-        case conv::ConversationEventType::Error:
-            ESP_LOGE(kTag, "conversation error: %s", ev.text.c_str());
-            state_.set_balloon_text("接続エラー", /*hold_ms=*/3000);
-            recover_after_error();
+        case conv::ConversationEventType::Error: {
+            // Transport errors (disconnect / handshake) are fatal — the
+            // session is gone and must be rebuilt. Server-side errors (bad
+            // request, a no-op cancellation, rate-limit notices, …) leave the
+            // session alive, so just log them and carry on.
+            const bool transport_error = ev.error == conv::ConversationError::NotConnected ||
+                                         ev.error == conv::ConversationError::TransportInit;
+            if (transport_error) {
+                ESP_LOGE(kTag, "transport error: %s — reconnecting", ev.text.c_str());
+                state_.set_balloon_text("接続エラー", /*hold_ms=*/3000);
+                recover_after_error();
+            } else {
+                ESP_LOGW(kTag, "server error (non-fatal): %s", ev.text.c_str());
+            }
             break;
+        }
         }
     }
 
@@ -518,6 +559,7 @@ private:
 
     SharedState& state_;
     std::string api_key_;
+    board::Si12tTouch* touch_; // top touch sensor for barge-in (may be null)
     conv::ConversationConfig config_{};
     std::unique_ptr<conv::OpenAiRealtimeClient> client_;
     QueueHandle_t event_queue_{nullptr};
@@ -529,20 +571,19 @@ private:
     std::array<std::vector<std::int16_t>, 2> mic_buf_{};
     int mic_read_{0};
 
-    std::vector<std::int16_t> assistant_pcm_;          // full reply, in PSRAM
+    std::vector<std::int16_t> assistant_pcm_;          // reply audio, in PSRAM (grows while streaming)
+    bool audio_complete_{false};                       // every AssistantAudioChunk has arrived
     std::array<std::int16_t*, kSegmentBuffers> seg_buf_{}; // internal-RAM playback ring
     std::size_t seg_pos_{0};                           // next sample in assistant_pcm_ to play
     std::size_t seg_next_{0};                          // next ring slot to write
-    std::vector<float> envelope_;
     std::uint32_t playback_start_ms_{0};
-    std::uint32_t playback_duration_ms_{0};
     std::string assistant_text_;
 };
 
 void conversation_task_entry(void* arg)
 {
     auto& args = *static_cast<ConversationTaskArgs*>(arg);
-    auto* coordinator = new Coordinator(*args.state, args.api_key);
+    auto* coordinator = new Coordinator(*args.state, args.api_key, args.touch);
     coordinator->run();
     // run() only returns by deleting the task; keep the object alive regardless.
     vTaskDelete(nullptr);

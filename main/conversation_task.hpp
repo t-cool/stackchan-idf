@@ -3,13 +3,15 @@
 
 #pragma once
 
+#include "board/si12t_touch.hpp"
 #include "shared_state.hpp"
 
 namespace stackchan::app {
 
 struct ConversationTaskArgs {
     SharedState* state;
-    const char* api_key; // OpenAI API key; empty disables the conversation
+    const char* api_key;          // OpenAI API key; empty disables the conversation
+    board::Si12tTouch* touch;     // top touch sensor for barge-in; may be null
 };
 
 // Pinned to core 0. Owns the OpenAI Realtime client and drives the half-duplex

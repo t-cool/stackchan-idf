@@ -321,9 +321,9 @@ extern "C" void app_main()
     g_state = new stackchan::app::SharedState{};
     g_render_args = new stackchan::app::RenderTaskArgs{.display = &board.display(), .state = g_state};
     g_servo_args = new stackchan::app::ServoTaskArgs{.state = g_state};
-    g_conversation_args =
-        new stackchan::app::ConversationTaskArgs{.state = g_state, .api_key = CONFIG_STACKCHAN_OPENAI_API_KEY};
     g_touch = board.touch_sensor();
+    g_conversation_args = new stackchan::app::ConversationTaskArgs{
+        .state = g_state, .api_key = CONFIG_STACKCHAN_OPENAI_API_KEY, .touch = g_touch};
 
     stackchan::app::start_render_task(*g_render_args);
     stackchan::app::start_servo_task(*g_servo_args);

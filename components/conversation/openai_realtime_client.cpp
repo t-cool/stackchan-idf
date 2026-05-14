@@ -188,6 +188,33 @@ public:
         return {};
     }
 
+    tl::expected<void, ConversationError> cancel_response()
+    {
+        std::lock_guard lock{send_mutex_};
+        if (client_ == nullptr || !esp_websocket_client_is_connected(client_)) {
+            return tl::unexpected{ConversationError::NotConnected};
+        }
+        // Only send response.cancel when a response is actually still being
+        // generated. The server streams replies faster than realtime, so by
+        // the time the user barges in the response is usually already done —
+        // sending response.cancel then just yields a "no active response"
+        // server error.
+        if (response_active_.exchange(false, std::memory_order_relaxed)) {
+            cJSON* root = cJSON_CreateObject();
+            cJSON_AddStringToObject(root, "type", "response.cancel");
+            const bool ok = send_json(root);
+            cJSON_Delete(root);
+            if (!ok) {
+                return tl::unexpected{ConversationError::SendFailed};
+            }
+        }
+        // The turn is over from our side — go straight back to Listening so
+        // push_audio is accepted again immediately.
+        pending_tool_call_ = false;
+        set_state(ConversationState::Listening);
+        return {};
+    }
+
     void set_event_callback(EventCallback cb) { event_callback_ = std::move(cb); }
 
     ConversationState state() const { return state_.load(std::memory_order_relaxed); }
@@ -415,6 +442,8 @@ private:
             ev.type = ConversationEventType::UserTranscript;
             ev.text = transcript != nullptr ? transcript : "";
             emit(ev);
+        } else if (std::strcmp(type, "response.created") == 0) {
+            response_active_.store(true, std::memory_order_relaxed);
         } else if (std::strcmp(type, "response.audio.delta") == 0) {
             handle_audio_delta(root);
         } else if (std::strcmp(type, "response.audio.done") == 0) {
@@ -445,6 +474,7 @@ private:
         } else if (std::strcmp(type, "response.function_call_arguments.done") == 0) {
             handle_function_call_done(root);
         } else if (std::strcmp(type, "response.done") == 0) {
+            response_active_.store(false, std::memory_order_relaxed);
             emit_simple(ConversationEventType::ResponseDone);
             if (!pending_tool_call_) {
                 set_state(ConversationState::Listening);
@@ -542,7 +572,8 @@ private:
 
     bool session_updated_{false};
     bool pending_tool_call_{false};
-    bool output_is_ulaw_{false}; // wire codec for assistant audio (g711_ulaw vs pcm16)
+    bool output_is_ulaw_{false};            // wire codec for assistant audio (g711_ulaw vs pcm16)
+    std::atomic<bool> response_active_{false}; // a response is mid-generation (set/cleared from the WS task)
 
     // RX frame reassembly (PSRAM).
     char* rx_buffer_{nullptr};
@@ -596,6 +627,11 @@ tl::expected<void, ConversationError> OpenAiRealtimeClient::submit_tool_result(s
                                                                                std::string_view output_json)
 {
     return impl_->submit_tool_result(call_id, output_json);
+}
+
+tl::expected<void, ConversationError> OpenAiRealtimeClient::cancel_response()
+{
+    return impl_->cancel_response();
 }
 
 ConversationState OpenAiRealtimeClient::state() const
