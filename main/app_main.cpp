@@ -271,6 +271,24 @@ extern "C" void app_main()
     // so the side that's done has to release the bus before the other
     // side can install its own driver.
 
+    // M5Unified's mic/speaker I2S tasks default to priority 2 — below the
+    // render (5), conversation (5), servo (4) and WebSocket (5) tasks — so
+    // they get starved and the I2S DMA underruns: choppy playback and gappy
+    // capture (which whisper then mistranscribes). Lift them above the app
+    // tasks and give the speaker extra DMA buffering for jitter margin.
+    {
+        auto spk = M5.Speaker.config();
+        spk.task_priority = 6;
+        spk.dma_buf_count = 16;
+        M5.Speaker.config(spk);
+        M5.Speaker.end();
+
+        auto mic = M5.Mic.config();
+        mic.task_priority = 6;
+        M5.Mic.config(mic);
+        M5.Mic.end();
+    }
+
     // Quick audio sanity check: a short rising arpeggio so we can hear
     // immediately whether the speaker is wired up correctly.
     M5.Speaker.setVolume(128);

@@ -13,6 +13,7 @@
 
 #include <M5Unified.h>
 #include <cJSON.h>
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
@@ -36,6 +37,16 @@ constexpr const char* kTag = "conv-task";
 constexpr std::uint32_t kSampleRate = 24000;
 constexpr std::size_t kMicChunkSamples = 960;  // 40 ms per mic chunk
 constexpr std::uint32_t kEnvelopeStepMs = 16;
+
+// Playback ring: M5.Speaker.playRaw references the buffer (no copy) and its
+// resampler reads it sample-by-sample. If that buffer is in PSRAM it contends
+// with the render task's 30 fps sprite traffic and the I2S DMA underruns
+// (choppy playback). So the reply is accumulated in PSRAM but played back in
+// segments copied into this small internal-RAM ring — the speaker only ever
+// reads from fast SRAM. 3 buffers: M5.Speaker holds 2, we always have 1 free.
+constexpr std::size_t kSegmentSamples = 8192;  // ~341 ms per segment at 24 kHz
+constexpr std::size_t kSegmentBuffers = 3;
+constexpr int kSpeakerChannel = 0;
 
 // Mic / speaker I2S handoff settle time (matches the existing audio code).
 constexpr TickType_t kI2sSettle = pdMS_TO_TICKS(20);
@@ -124,6 +135,19 @@ public:
         event_queue_ = xQueueCreate(32, sizeof(conv::ConversationEvent*));
         mic_buf_[0].resize(kMicChunkSamples);
         mic_buf_[1].resize(kMicChunkSamples);
+
+        // Segment ring must live in internal RAM (see kSegmentSamples comment).
+        // The Coordinator object itself is heap-allocated and large enough to
+        // land in PSRAM, so these can't just be member arrays.
+        for (auto& buf : seg_buf_) {
+            buf = static_cast<std::int16_t*>(
+                heap_caps_malloc(kSegmentSamples * sizeof(std::int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+            if (buf == nullptr) {
+                ESP_LOGE(kTag, "failed to allocate internal-RAM segment buffer");
+                vTaskDelete(nullptr);
+                return;
+            }
+        }
 
         client_ = std::make_unique<conv::OpenAiRealtimeClient>(api_key_);
         client_->set_event_callback([this](const conv::ConversationEvent& ev) { enqueue_event(ev); });
@@ -223,13 +247,33 @@ private:
             }
             break;
         case Local::Speaking:
-            update_mouth();
-            if (!M5.Speaker.isPlaying()) {
-                finish_speaking();
-            } else {
-                vTaskDelay(pdMS_TO_TICKS(15));
-            }
+            service_playback();
             break;
+        }
+    }
+
+    // Stream the PSRAM reply out through the internal-RAM segment ring. Feed
+    // M5.Speaker while it has a free slot (it keeps a 2-deep queue); copying a
+    // segment is a fast bulk memcpy, unlike the speaker's sample-by-sample
+    // resampler read. Non-blocking so mouth-sync keeps ticking.
+    void service_playback()
+    {
+        while (seg_pos_ < assistant_pcm_.size() &&
+               M5.Speaker.isPlaying(kSpeakerChannel) < kSegmentBuffers - 1) {
+            const std::size_t n = std::min(kSegmentSamples, assistant_pcm_.size() - seg_pos_);
+            std::memcpy(seg_buf_[seg_next_], assistant_pcm_.data() + seg_pos_, n * sizeof(std::int16_t));
+            M5.Speaker.playRaw(seg_buf_[seg_next_], n, kSampleRate, /*stereo=*/false,
+                               /*repeat=*/1, kSpeakerChannel, /*stop_current_sound=*/false);
+            seg_pos_ += n;
+            seg_next_ = (seg_next_ + 1) % kSegmentBuffers;
+        }
+
+        update_mouth();
+
+        if (seg_pos_ >= assistant_pcm_.size() && M5.Speaker.isPlaying(kSpeakerChannel) == 0) {
+            finish_speaking();
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
 
@@ -285,7 +329,11 @@ private:
         playback_duration_ms_ =
             static_cast<std::uint32_t>(static_cast<std::uint64_t>(assistant_pcm_.size()) * 1000u / kSampleRate);
 
-        M5.Speaker.playRaw(assistant_pcm_.data(), assistant_pcm_.size(), kSampleRate, /*stereo=*/false);
+        // The reply stays in PSRAM; service_state() streams it out segment by
+        // segment through the internal-RAM ring so the speaker never reads
+        // PSRAM directly. Playback itself starts on the next service tick.
+        seg_pos_ = 0;
+        seg_next_ = 0;
         local_ = Local::Speaking;
         ESP_LOGI(kTag, "speaking %u ms of reply", static_cast<unsigned>(playback_duration_ms_));
     }
@@ -479,7 +527,10 @@ private:
     std::array<std::vector<std::int16_t>, 2> mic_buf_{};
     int mic_read_{0};
 
-    std::vector<std::int16_t> assistant_pcm_;
+    std::vector<std::int16_t> assistant_pcm_;          // full reply, in PSRAM
+    std::array<std::int16_t*, kSegmentBuffers> seg_buf_{}; // internal-RAM playback ring
+    std::size_t seg_pos_{0};                           // next sample in assistant_pcm_ to play
+    std::size_t seg_next_{0};                          // next ring slot to write
     std::vector<float> envelope_;
     std::uint32_t playback_start_ms_{0};
     std::uint32_t playback_duration_ms_{0};
