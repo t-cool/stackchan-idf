@@ -13,10 +13,10 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
-#include "audio_codec.hpp"
 #include "avatar/expression.hpp"
 #include "board/board.hpp"
 #include "board/si12t_touch.hpp"
+#include "conversation_task.hpp"
 #include "render_task.hpp"
 #include "servo_task.hpp"
 #include "shared_state.hpp"
@@ -31,6 +31,7 @@ constexpr const char* kTag = "stackchan";
 stackchan::app::SharedState* g_state = nullptr;
 stackchan::app::RenderTaskArgs* g_render_args = nullptr;
 stackchan::app::ServoTaskArgs* g_servo_args = nullptr;
+stackchan::app::ConversationTaskArgs* g_conversation_args = nullptr;
 stackchan::board::Si12tTouch* g_touch = nullptr;
 
 // CoreS3 mic + speaker share I2S_NUM_1, so we have to hand the bus around
@@ -144,6 +145,14 @@ void demo_loop()
 
         const std::uint32_t now_ms = static_cast<std::uint32_t>(esp_timer_get_time() / 1000);
 
+        // While a conversation session is live the conversation task owns the
+        // I2S bus, the avatar mouth, and the balloon — stand the demo behaviour
+        // down entirely so the two don't fight.
+        if (g_state->conversation_active.load(std::memory_order_relaxed)) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
         // Mouth opens with the current speech envelope; closed while silent.
         g_state->mouth_open.store(speech.current_mouth_open(), std::memory_order_relaxed);
 
@@ -158,23 +167,6 @@ void demo_loop()
             g_state->clear_balloon();
             wifi_warning_active = false;
             next_speech_ms = now_ms + 1500;
-        }
-
-        // Tap-to-record: any single-finger click cancels current babble and
-        // runs a 10-second AAC record + playback. Blocks demo_loop for ~20 s
-        // but the render task keeps animating.
-        if (M5.Touch.getDetail(0).wasClicked()) {
-            speech.stop();
-            g_state->set_balloon_text("Recording 10s...", /*hold_ms=*/UINT32_MAX);
-            app::AacRecording rec;
-            if (app::record_aac(10, rec)) {
-                g_state->set_balloon_text("Playing AAC...", /*hold_ms=*/UINT32_MAX);
-                app::play_aac(rec);
-            }
-            g_state->clear_balloon();
-            next_speech_ms = now_ms + 1500;
-            balloon_in_flight.store(false, std::memory_order_release);
-            continue;
         }
 
         // Kick off a new babble + balloon once the previous balloon is done
@@ -311,10 +303,16 @@ extern "C" void app_main()
     g_state = new stackchan::app::SharedState{};
     g_render_args = new stackchan::app::RenderTaskArgs{.display = &board.display(), .state = g_state};
     g_servo_args = new stackchan::app::ServoTaskArgs{.state = g_state};
+    g_conversation_args =
+        new stackchan::app::ConversationTaskArgs{.state = g_state, .api_key = CONFIG_STACKCHAN_OPENAI_API_KEY};
     g_touch = board.touch_sensor();
 
     stackchan::app::start_render_task(*g_render_args);
     stackchan::app::start_servo_task(*g_servo_args);
+    // The conversation task waits for Wi-Fi internally, then takes over the
+    // I2S bus for always-on voice chat. Started after the boot-time mic test
+    // so the two never contend for the bus.
+    stackchan::app::start_conversation_task(*g_conversation_args);
 
     ESP_LOGI(kTag, "ready");
     demo_loop();

@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "app_main.cpp"
         "audio_codec.cpp"
+        "conversation_task.cpp"
         "render_task.cpp"
         "servo_task.cpp"
         "speech.cpp"
@@ -11,6 +12,8 @@ idf_component_register(
         board
         scs_servo
         avatar
+        conversation
+        json
         M5Unified
         M5GFX
         esp_timer
