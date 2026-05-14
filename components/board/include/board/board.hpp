@@ -15,7 +15,11 @@ enum class Error {
     DisplayInit,
     ExpanderProbe,
     ExpanderWrite,
+    TouchProbe,
+    TouchRead,
 };
+
+class Si12tTouch;
 
 class Board {
 public:
@@ -30,6 +34,11 @@ public:
     M5GFX& display() noexcept;
 
     tl::expected<void, Error> set_servo_power(bool on);
+
+    // Top-mounted Si12T touch sensor. nullptr if the chip didn't probe at
+    // boot (e.g. older base hardware without the sensor); callers should
+    // null-check before using.
+    Si12tTouch* touch_sensor() noexcept;
 
 private:
     Board() = default;

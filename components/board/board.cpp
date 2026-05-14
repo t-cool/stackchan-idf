@@ -3,12 +3,16 @@
 
 #include "board/board.hpp"
 
+#include <optional>
+#include <utility>
+
 #include <M5Unified.h>
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
 #include "board/io_expander_py32.hpp"
+#include "board/si12t_touch.hpp"
 
 namespace stackchan::board {
 
@@ -18,12 +22,17 @@ constexpr const char* kTag = "board";
 
 class Board::Impl {
 public:
-    explicit Impl(Py32Expander&& expander) noexcept : expander_{std::move(expander)} {}
+    Impl(Py32Expander&& expander, std::optional<Si12tTouch>&& touch) noexcept
+        : expander_{std::move(expander)}, touch_{std::move(touch)}
+    {
+    }
 
     Py32Expander& expander() noexcept { return expander_; }
+    Si12tTouch* touch() noexcept { return touch_ ? &*touch_ : nullptr; }
 
 private:
     Py32Expander expander_;
+    std::optional<Si12tTouch> touch_;
 };
 
 tl::expected<Board, Error> Board::begin()
@@ -57,8 +66,18 @@ tl::expected<Board, Error> Board::begin()
         return tl::unexpected{r.error()};
     }
 
+    // Top-mounted touch sensor (Si12T at 0x68). Optional — older bases
+    // without the chip should still boot, so we just log a warning and
+    // carry on if it doesn't respond.
+    std::optional<Si12tTouch> touch;
+    if (auto t = Si12tTouch::probe(); t) {
+        touch.emplace(std::move(*t));
+    } else {
+        ESP_LOGW(kTag, "Si12T touch sensor not found at 0x%02X", Si12tTouch::kAddress);
+    }
+
     Board board;
-    board.impl_ = std::make_shared<Impl>(std::move(*expander));
+    board.impl_ = std::make_shared<Impl>(std::move(*expander), std::move(touch));
     ESP_LOGI(kTag, "board initialized (servo power: OFF)");
     return board;
 }
@@ -71,6 +90,11 @@ M5GFX& Board::display() noexcept
 tl::expected<void, Error> Board::set_servo_power(bool on)
 {
     return impl_->expander().digital_write(Py32Expander::kPinServoPowerEnable, on);
+}
+
+Si12tTouch* Board::touch_sensor() noexcept
+{
+    return impl_->touch();
 }
 
 } // namespace stackchan::board

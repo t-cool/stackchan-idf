@@ -75,12 +75,18 @@ void servo_task_entry(void* arg)
         const std::uint16_t yaw_target = scs_servo::deg_to_raw(yaw_deg, scs_servo::kYawZero);
         const std::uint16_t pitch_target = scs_servo::deg_to_raw(pitch_deg, scs_servo::kPitchZero);
 
+        // Non-zero servo_speed_override lets the demo task drive snappy
+        // gestures (e.g. head shake on nadenade) without permanently raising
+        // the default head-turn speed.
+        const std::uint16_t override = args.state->servo_speed_override.load(std::memory_order_relaxed);
+        const std::uint16_t speed = override != 0 ? override : kGoalSpeed;
+
         if (yaw_target != last_yaw_target) {
-            (void)yaw.write_goal_position(yaw_target, kGoalTime, kGoalSpeed);
+            (void)yaw.write_goal_position(yaw_target, kGoalTime, speed);
             last_yaw_target = yaw_target;
         }
         if (pitch_target != last_pitch_target) {
-            (void)pitch.write_goal_position(pitch_target, kGoalTime, kGoalSpeed);
+            (void)pitch.write_goal_position(pitch_target, kGoalTime, speed);
             last_pitch_target = pitch_target;
         }
 

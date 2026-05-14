@@ -26,6 +26,9 @@ public:
     std::atomic<float> target_pitch_deg{0.0f};
     std::atomic<float> mouth_open{0.0f};
     std::atomic<int> expression{static_cast<int>(avatar::Expression::Neutral)};
+    // Non-zero overrides the servo task's default Goal Speed for the next
+    // write_goal_position. Used for snappy gestures (head shake).
+    std::atomic<std::uint16_t> servo_speed_override{0};
 
     // Show `text` in the balloon.
     //  - hold_ms: minimum on-screen time (0 = use avatar defaults — short

@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "board.cpp"
         "io_expander_py32.cpp"
+        "si12t_touch.cpp"
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "."
     REQUIRES

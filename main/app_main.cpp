@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Kenta IDA <fuga@fugafuga.org>
 // SPDX-License-Identifier: BSL-1.0
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -15,6 +16,7 @@
 #include "audio_codec.hpp"
 #include "avatar/expression.hpp"
 #include "board/board.hpp"
+#include "board/si12t_touch.hpp"
 #include "render_task.hpp"
 #include "servo_task.hpp"
 #include "shared_state.hpp"
@@ -29,6 +31,7 @@ constexpr const char* kTag = "stackchan";
 stackchan::app::SharedState* g_state = nullptr;
 stackchan::app::RenderTaskArgs* g_render_args = nullptr;
 stackchan::app::ServoTaskArgs* g_servo_args = nullptr;
+stackchan::board::Si12tTouch* g_touch = nullptr;
 
 // CoreS3 mic + speaker share I2S_NUM_1, so we have to hand the bus around
 // explicitly. Records `seconds` of audio at 16 kHz then plays it straight
@@ -117,6 +120,15 @@ void demo_loop()
     std::uint32_t next_pose_ms = 0;
     std::uint32_t next_speech_ms = 2000; // first babble shortly after boot
 
+    // Nadenade (head-petting) detection on the top-mounted Si12T sensor.
+    // Any zone touched continuously for kNadenadeMinTouchMs triggers a
+    // cute head-shake; kNadenadeCooldownMs prevents retriggering while the
+    // user's hand is still on the head.
+    constexpr std::uint32_t kNadenadeMinTouchMs = 250;
+    constexpr std::uint32_t kNadenadeCooldownMs = 4000;
+    std::uint32_t touch_start_ms = 0;     // 0 = no touch in progress
+    std::uint32_t next_nadenade_ms = 0;   // earliest time we'll trigger again
+
     // Set true by the (render-task) completion callback so demo_loop knows
     // the previous balloon finished. Atomics keep it thread-safe.
     static std::atomic<bool> balloon_in_flight{false};
@@ -181,6 +193,55 @@ void demo_loop()
                 balloon_in_flight.store(false, std::memory_order_release);
             });
             next_speech_ms = now_ms + rand_range_ms(kSpeechMinMs, kSpeechMaxMs);
+        }
+
+        // Nadenade: poll the top sensor, debounce, and on a sustained touch
+        // run a quick happy head-wobble while the petting continues. The
+        // wobble blocks demo_loop's normal scheduling for ~1.4 s but the
+        // render and servo tasks keep running so animation stays smooth.
+        if (g_touch != nullptr && !wifi_warning_active && now_ms >= next_nadenade_ms) {
+            const auto reading = g_touch->read();
+            if (reading.any_touched()) {
+                if (touch_start_ms == 0) {
+                    touch_start_ms = now_ms;
+                } else if (now_ms - touch_start_ms >= kNadenadeMinTouchMs) {
+                    speech.stop();
+                    const float prev_yaw = g_state->target_yaw_deg.load(std::memory_order_relaxed);
+                    const int prev_expr = g_state->expression.load(std::memory_order_relaxed);
+
+                    g_state->expression.store(static_cast<int>(avatar::Expression::Happy),
+                                              std::memory_order_relaxed);
+                    g_state->servo_speed_override.store(800, std::memory_order_relaxed); // ~120°/s
+                    balloon_in_flight.store(true, std::memory_order_release);
+                    g_state->set_balloon_text("なでなで♡", /*hold_ms=*/2200, [] {
+                        balloon_in_flight.store(false, std::memory_order_release);
+                    });
+
+                    constexpr float kWobbleDeg = 8.0f;
+                    constexpr std::uint32_t kHalfPeriodMs = 160;
+                    for (int i = 0; i < 4; ++i) {
+                        g_state->target_yaw_deg.store(-kWobbleDeg, std::memory_order_relaxed);
+                        vTaskDelay(pdMS_TO_TICKS(kHalfPeriodMs));
+                        g_state->target_yaw_deg.store(+kWobbleDeg, std::memory_order_relaxed);
+                        vTaskDelay(pdMS_TO_TICKS(kHalfPeriodMs));
+                    }
+                    g_state->target_yaw_deg.store(prev_yaw, std::memory_order_relaxed);
+                    vTaskDelay(pdMS_TO_TICKS(kHalfPeriodMs));
+                    g_state->servo_speed_override.store(0, std::memory_order_relaxed);
+                    g_state->expression.store(prev_expr, std::memory_order_relaxed);
+
+                    touch_start_ms = 0;
+                    const std::uint32_t after_ms = static_cast<std::uint32_t>(esp_timer_get_time() / 1000);
+                    next_nadenade_ms = after_ms + kNadenadeCooldownMs;
+                    // Push back demo activity so the wobble doesn't fight a
+                    // freshly-scheduled random pose / babble.
+                    next_speech_ms = after_ms + 1500;
+                    next_pose_ms = std::max(next_pose_ms, after_ms + 2000);
+                    continue;
+                }
+            } else {
+                touch_start_ms = 0;
+            }
         }
 
         // Random yaw + pitch every 10–20 s.
@@ -250,6 +311,7 @@ extern "C" void app_main()
     g_state = new stackchan::app::SharedState{};
     g_render_args = new stackchan::app::RenderTaskArgs{.display = &board.display(), .state = g_state};
     g_servo_args = new stackchan::app::ServoTaskArgs{.state = g_state};
+    g_touch = board.touch_sensor();
 
     stackchan::app::start_render_task(*g_render_args);
     stackchan::app::start_servo_task(*g_servo_args);
