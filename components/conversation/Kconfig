@@ -11,7 +11,7 @@ menu "Stackchan Conversation"
 
     config STACKCHAN_OPENAI_REALTIME_MODEL
         string "OpenAI Realtime model"
-        default "gpt-4o-realtime-preview"
+        default "gpt-realtime"
 
     config STACKCHAN_OPENAI_VOICE
         string "OpenAI Realtime voice"

@@ -98,7 +98,9 @@ public:
 
         const std::string auth = std::string{"Bearer "} + api_key_;
         esp_websocket_client_append_header(client_, "Authorization", auth.c_str());
-        esp_websocket_client_append_header(client_, "OpenAI-Beta", "realtime=v1");
+        // OpenAI Realtime is GA — the OpenAI-Beta: realtime=v1 header is no
+        // longer accepted (the server returns "Realtime Beta API is no longer
+        // supported").
 
         esp_websocket_register_events(client_, WEBSOCKET_EVENT_ANY, &Impl::websocket_event_trampoline, this);
 
@@ -353,34 +355,64 @@ private:
 
     void send_session_update()
     {
+        // GA Realtime API session.update payload:
+        //   { "type": "session.update",
+        //     "session": { "type": "realtime",
+        //                  "model": "...",
+        //                  "output_modalities": ["audio"],
+        //                  "instructions": "...",
+        //                  "audio": { "input":  { "format": {...}, "turn_detection": {...},
+        //                                         "transcription": {...} },
+        //                             "output": { "format": {...}, "voice": "..." } },
+        //                  "tools": [...], "tool_choice": "auto" } }
         cJSON* root = cJSON_CreateObject();
         cJSON_AddStringToObject(root, "type", "session.update");
         cJSON* session = cJSON_AddObjectToObject(root, "session");
+        cJSON_AddStringToObject(session, "type", "realtime");
 
-        cJSON* modalities = cJSON_AddArrayToObject(session, "modalities");
-        cJSON_AddItemToArray(modalities, cJSON_CreateString("audio"));
-        cJSON_AddItemToArray(modalities, cJSON_CreateString("text"));
+        if (!config_.model.empty()) {
+            cJSON_AddStringToObject(session, "model", config_.model.c_str());
+        }
+
+        cJSON* mods = cJSON_AddArrayToObject(session, "output_modalities");
+        cJSON_AddItemToArray(mods, cJSON_CreateString("audio"));
 
         if (!config_.instructions.empty()) {
             cJSON_AddStringToObject(session, "instructions", config_.instructions.c_str());
         }
-        if (!config_.voice.empty()) {
-            cJSON_AddStringToObject(session, "voice", config_.voice.c_str());
-        }
-        cJSON_AddStringToObject(session, "input_audio_format", "pcm16");
-        cJSON_AddStringToObject(session, "output_audio_format", output_is_ulaw_ ? "g711_ulaw" : "pcm16");
 
-        if (config_.enable_input_transcription) {
-            cJSON* tr = cJSON_AddObjectToObject(session, "input_audio_transcription");
-            cJSON_AddStringToObject(tr, "model", "whisper-1");
-        }
+        // ---- audio.input / audio.output ----
+        cJSON* audio = cJSON_AddObjectToObject(session, "audio");
 
-        cJSON* vad = cJSON_AddObjectToObject(session, "turn_detection");
+        cJSON* in = cJSON_AddObjectToObject(audio, "input");
+        cJSON* in_fmt = cJSON_AddObjectToObject(in, "format");
+        cJSON_AddStringToObject(in_fmt, "type", "audio/pcm");
+        cJSON_AddNumberToObject(in_fmt, "rate", config_.input_sample_rate_hz);
+
+        cJSON* vad = cJSON_AddObjectToObject(in, "turn_detection");
         cJSON_AddStringToObject(vad, "type", "server_vad");
         cJSON_AddNumberToObject(vad, "threshold", config_.vad_threshold);
         cJSON_AddNumberToObject(vad, "prefix_padding_ms", config_.vad_prefix_padding_ms);
         cJSON_AddNumberToObject(vad, "silence_duration_ms", config_.vad_silence_ms);
 
+        if (config_.enable_input_transcription) {
+            cJSON* tr = cJSON_AddObjectToObject(in, "transcription");
+            cJSON_AddStringToObject(tr, "model", "whisper-1");
+        }
+
+        cJSON* out = cJSON_AddObjectToObject(audio, "output");
+        cJSON* out_fmt = cJSON_AddObjectToObject(out, "format");
+        if (output_is_ulaw_) {
+            cJSON_AddStringToObject(out_fmt, "type", "audio/pcmu"); // G.711 µ-law @ 8 kHz
+        } else {
+            cJSON_AddStringToObject(out_fmt, "type", "audio/pcm");
+            cJSON_AddNumberToObject(out_fmt, "rate", config_.output_sample_rate_hz);
+        }
+        if (!config_.voice.empty()) {
+            cJSON_AddStringToObject(out, "voice", config_.voice.c_str());
+        }
+
+        // ---- tools ----
         cJSON* tools = cJSON_AddArrayToObject(session, "tools");
         for (const auto& tool : config_.tools) {
             cJSON* t = cJSON_CreateObject();
@@ -444,18 +476,22 @@ private:
             emit(ev);
         } else if (std::strcmp(type, "response.created") == 0) {
             response_active_.store(true, std::memory_order_relaxed);
-        } else if (std::strcmp(type, "response.audio.delta") == 0) {
+        } else if (std::strcmp(type, "response.output_audio.delta") == 0 ||
+                   std::strcmp(type, "response.audio.delta") == 0) { // GA / beta names
             handle_audio_delta(root);
-        } else if (std::strcmp(type, "response.audio.done") == 0) {
+        } else if (std::strcmp(type, "response.output_audio.done") == 0 ||
+                   std::strcmp(type, "response.audio.done") == 0) {
             emit_simple(ConversationEventType::AssistantAudioDone);
-        } else if (std::strcmp(type, "response.audio_transcript.delta") == 0 ||
+        } else if (std::strcmp(type, "response.output_audio_transcript.delta") == 0 ||
+                   std::strcmp(type, "response.audio_transcript.delta") == 0 ||
                    std::strcmp(type, "response.text.delta") == 0) {
             const char* delta = json_str(root, "delta");
             ConversationEvent ev{};
             ev.type = ConversationEventType::AssistantTextDelta;
             ev.text = delta != nullptr ? delta : "";
             emit(ev);
-        } else if (std::strcmp(type, "response.audio_transcript.done") == 0 ||
+        } else if (std::strcmp(type, "response.output_audio_transcript.done") == 0 ||
+                   std::strcmp(type, "response.audio_transcript.done") == 0 ||
                    std::strcmp(type, "response.text.done") == 0) {
             const char* full = json_str(root, "transcript");
             if (full == nullptr) {
