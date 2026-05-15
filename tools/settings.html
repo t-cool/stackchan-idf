@@ -78,6 +78,22 @@
   }
   input:focus { border-color: #2196f3; }
   .hint { font-size: 0.78rem; color: #888; margin-top: 0.2rem; }
+  .toggle-label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.9rem;
+    font-weight: 500;
+    margin-top: 1rem;
+    cursor: pointer;
+    user-select: none;
+  }
+  .toggle-label input[type=checkbox] {
+    width: 1.1rem;
+    height: 1.1rem;
+    accent-color: #1976d2;
+    cursor: pointer;
+  }
   .actions { margin-top: 1.5rem; display: flex; gap: 0.75rem; flex-wrap: wrap; }
   button {
     padding: 0.55rem 1.2rem;
@@ -156,6 +172,7 @@
       <span class="flag" id="flag-ssid" title="SSID 設定済み">S</span>
       <span class="flag" id="flag-pass" title="Password 設定済み">P</span>
       <span class="flag" id="flag-key"  title="API key 設定済み">K</span>
+      <span class="flag" id="flag-en"   title="OpenAI 有効">O</span>
     </span>
   </div>
 
@@ -176,6 +193,12 @@
 
   <label for="apikey">OpenAI API キー</label>
   <input type="password" id="apikey" maxlength="256" placeholder="sk-… （変更しない場合は空欄）">
+
+  <label class="toggle-label" for="openai-enabled" style="margin-top:1rem">
+    <input type="checkbox" id="openai-enabled" checked>
+    <span>OpenAI 会話機能を有効にする</span>
+  </label>
+  <p class="hint">オフにすると API キーは残したまま会話タスクを起動しません</p>
 
   <div class="actions">
     <button id="btn-connect">BLE 接続</button>
@@ -201,6 +224,7 @@ const CHR_KEY     = 'e3f0a003-7b1c-4d2a-9e6f-2c5a8d4b1f00';
 const CHR_APPLY   = 'e3f0a004-7b1c-4d2a-9e6f-2c5a8d4b1f00';
 const CHR_STATUS  = 'e3f0a005-7b1c-4d2a-9e6f-2c5a8d4b1f00';
 const CHR_KX      = 'e3f0a006-7b1c-4d2a-9e6f-2c5a8d4b1f00';
+const CHR_EN      = 'e3f0a007-7b1c-4d2a-9e6f-2c5a8d4b1f00';
 
 // Device Information Service (Bluetooth SIG-assigned, UUID 0x180A).
 // Web Bluetooth accepts the standard short names.
@@ -215,7 +239,7 @@ const DIS_CHRS = {
 
 // --- State ---
 let bleDevice = null, bleServer = null, svc = null;
-let chrSsid = null, chrPass = null, chrKey = null, chrApply = null, chrStatus = null, chrKx = null;
+let chrSsid = null, chrPass = null, chrKey = null, chrApply = null, chrStatus = null, chrKx = null, chrEn = null;
 let aesKey = null;  // CryptoKey for AES-256-GCM, derived per connection
 
 // --- Log ---
@@ -246,6 +270,7 @@ function updateStatus(data) {
   document.getElementById('flag-ssid').classList.toggle('set', !!(flags & 0x01));
   document.getElementById('flag-pass').classList.toggle('set', !!(flags & 0x02));
   document.getElementById('flag-key' ).classList.toggle('set', !!(flags & 0x04));
+  document.getElementById('flag-en'  ).classList.toggle('set', !!(flags & 0x08));
   const wifiDot = document.getElementById('wifi-dot');
   wifiDot.className = 'dot ' + (wifi ? 'wifi-connected' : '');
   document.getElementById('wifi-label').textContent = wifi ? 'Wi-Fi: 接続中' : 'Wi-Fi: 切断中';
@@ -383,13 +408,14 @@ document.getElementById('btn-connect').addEventListener('click', async () => {
     log('GATT 接続完了', 'ok');
 
     svc = await bleServer.getPrimaryService(SVC_UUID);
-    [chrSsid, chrPass, chrKey, chrApply, chrStatus, chrKx] = await Promise.all([
+    [chrSsid, chrPass, chrKey, chrApply, chrStatus, chrKx, chrEn] = await Promise.all([
       svc.getCharacteristic(CHR_SSID),
       svc.getCharacteristic(CHR_PASS),
       svc.getCharacteristic(CHR_KEY),
       svc.getCharacteristic(CHR_APPLY),
       svc.getCharacteristic(CHR_STATUS),
       svc.getCharacteristic(CHR_KX),
+      svc.getCharacteristic(CHR_EN),
     ]);
     log('Characteristics 取得完了', 'ok');
 
@@ -420,6 +446,16 @@ document.getElementById('btn-connect').addEventListener('click', async () => {
       updateStatus(new DataView(stBytes.buffer, stBytes.byteOffset, stBytes.byteLength));
     } catch (e) {
       log(`Status 読み取りエラー: ${e.message}`, 'err');
+    }
+
+    try {
+      const enBytes = await readEncrypted(chrEn);
+      const enabled = enBytes.length > 0 && enBytes[0] !== 0;
+      document.getElementById('openai-enabled').checked = enabled;
+      document.getElementById('openai-enabled').dataset.initial = enabled ? '1' : '0';
+      log(`OpenAI 会話機能: ${enabled ? '有効' : '無効'}`);
+    } catch (e) {
+      log(`OpenAI 有効状態の取得失敗: ${e.message}`, 'err');
     }
 
     // Subscribe to Status notifications — notify payloads are encrypted too.
@@ -453,9 +489,10 @@ document.getElementById('btn-connect').addEventListener('click', async () => {
 function onDisconnected() {
   log('切断されました', 'err');
   setBleUi(false);
-  chrSsid = chrPass = chrKey = chrApply = chrStatus = chrKx = null;
+  chrSsid = chrPass = chrKey = chrApply = chrStatus = chrKx = chrEn = null;
   aesKey = null;
   clearDeviceInfo();
+  delete document.getElementById('openai-enabled').dataset.initial;
 }
 
 // --- Manual disconnect ---
@@ -489,6 +526,15 @@ document.getElementById('btn-apply').addEventListener('click', async () => {
     if (key) {
       await writeEncrypted(chrKey, strToBytes(key));
       log('API キー 書き込み完了', 'ok');
+    }
+
+    // Only push the enable flag if it changed from what we read at connect.
+    const enCheckbox = document.getElementById('openai-enabled');
+    const enInitial = enCheckbox.dataset.initial;
+    const enWanted = enCheckbox.checked ? '1' : '0';
+    if (enInitial !== undefined && enInitial !== enWanted) {
+      await writeEncrypted(chrEn, new Uint8Array([enCheckbox.checked ? 1 : 0]));
+      log(`OpenAI 会話機能を ${enCheckbox.checked ? '有効' : '無効'} に切り替え`, 'ok');
     }
 
     log('Apply を送信しています…');

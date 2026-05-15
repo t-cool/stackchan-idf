@@ -3,6 +3,7 @@
 
 #include "config_store.hpp"
 
+#include <cstdint>
 #include <cstring>
 #include <utility>
 
@@ -18,6 +19,7 @@ constexpr const char* kNs = "stackchan_cfg";
 constexpr const char* kKeySsid = "wifi_ssid";
 constexpr const char* kKeyPass = "wifi_pass";
 constexpr const char* kKeyApiKey = "openai_key";
+constexpr const char* kKeyOpenAiEnabled = "openai_en";
 
 std::string nvs_read_str(nvs_handle_t h, const char* key)
 {
@@ -54,6 +56,14 @@ DeviceConfig load()
     cfg.wifi_ssid = nvs_read_str(h, kKeySsid);
     cfg.wifi_password = nvs_read_str(h, kKeyPass);
     cfg.openai_api_key = nvs_read_str(h, kKeyApiKey);
+    // Default to enabled when the key is missing (pre-flag NVS contents).
+    std::uint8_t enabled = 1;
+    esp_err_t en_err = nvs_get_u8(h, kKeyOpenAiEnabled, &enabled);
+    if (en_err == ESP_OK) {
+        cfg.openai_enabled = (enabled != 0);
+    } else if (en_err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(kTag, "nvs_get_u8(%s): %s", kKeyOpenAiEnabled, esp_err_to_name(en_err));
+    }
     nvs_close(h);
     return cfg;
 }
@@ -79,6 +89,13 @@ tl::expected<void, Error> save(const DeviceConfig& cfg)
             nvs_close(h);
             return tl::unexpected(Error::NvsWrite);
         }
+    }
+
+    err = nvs_set_u8(h, kKeyOpenAiEnabled, cfg.openai_enabled ? 1 : 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(kTag, "nvs_set_u8(%s): %s", kKeyOpenAiEnabled, esp_err_to_name(err));
+        nvs_close(h);
+        return tl::unexpected(Error::NvsWrite);
     }
 
     err = nvs_commit(h);

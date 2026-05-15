@@ -351,9 +351,17 @@ extern "C" void app_main()
     g_touch = board.touch_sensor();
 
     // API key: prefer NVS value; fall back to Kconfig (sdkconfig.defaults.local).
-    const char* api_key = !cfg.openai_api_key.empty()
-                              ? cfg.openai_api_key.c_str()
-                              : CONFIG_STACKCHAN_OPENAI_API_KEY;
+    // openai_enabled is the user-controlled master switch — when off, the
+    // conversation task starts but immediately exits, as if no key were set.
+    // The key itself stays in NVS so the user can re-enable without re-typing.
+    const char* api_key = "";
+    if (!cfg.openai_enabled) {
+        ESP_LOGI(kTag, "OpenAI conversation disabled by configuration");
+    } else if (!cfg.openai_api_key.empty()) {
+        api_key = cfg.openai_api_key.c_str();
+    } else {
+        api_key = CONFIG_STACKCHAN_OPENAI_API_KEY;
+    }
 
     g_conversation_args = new stackchan::app::ConversationTaskArgs{
         .state = g_state, .api_key = api_key, .touch = g_touch};

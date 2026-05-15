@@ -12,6 +12,12 @@ struct DeviceConfig {
     std::string wifi_ssid;
     std::string wifi_password;
     std::string openai_api_key;
+    // Master switch for the OpenAI Realtime conversation task. Independent
+    // of openai_api_key so the key can stay persisted while the feature is
+    // turned off (saves data, lets the user take Stack-chan offline without
+    // losing setup). Defaults to true for backwards compatibility with
+    // existing NVS contents that pre-date this flag.
+    bool openai_enabled = true;
 };
 
 enum class Error {

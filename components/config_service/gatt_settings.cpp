@@ -37,6 +37,7 @@ constexpr const char* kTag = "cfg-gatt";
 // Service: e3f0a000-7b1c-4d2a-9e6f-2c5a8d4b1f00
 // SSID:    e3f0a001-...  Pass: e3f0a002-...  Key: e3f0a003-...
 // Apply:   e3f0a004-...  Status: e3f0a005-...  KeyExchange: e3f0a006-...
+// OpenAiEnabled: e3f0a007-...
 
 static const ble_uuid128_t kSvcUuid = BLE_UUID128_INIT(
     0x00, 0x1f, 0x4b, 0x8d, 0x5a, 0x2c, 0x6f, 0x9e,
@@ -62,12 +63,19 @@ static const ble_uuid128_t kStatusUuid = BLE_UUID128_INIT(
 static const ble_uuid128_t kKeyExchangeUuid = BLE_UUID128_INIT(
     0x00, 0x1f, 0x4b, 0x8d, 0x5a, 0x2c, 0x6f, 0x9e,
     0x2a, 0x4d, 0x1c, 0x7b, 0x06, 0xa0, 0xf0, 0xe3);
+// OpenAiEnabled — encrypted 1-byte flag (0=disabled, 1=enabled). The API key
+// is kept independently in NVS; this is a master switch the user can flip to
+// take Stack-chan offline without forgetting their setup.
+static const ble_uuid128_t kOpenAiEnabledUuid = BLE_UUID128_INIT(
+    0x00, 0x1f, 0x4b, 0x8d, 0x5a, 0x2c, 0x6f, 0x9e,
+    0x2a, 0x4d, 0x1c, 0x7b, 0x07, 0xa0, 0xf0, 0xe3);
 
 // --- Mutable state guarded by g_mutex ---
 static SemaphoreHandle_t g_mutex = nullptr;
 
 struct StagingBuffer {
     std::optional<std::string> ssid, password, api_key;
+    std::optional<bool> openai_enabled;
 };
 
 static DeviceConfig g_active;
@@ -83,6 +91,7 @@ static uint16_t g_key_handle = 0;
 static uint16_t g_apply_handle = 0;
 static uint16_t g_status_handle = 0;
 static uint16_t g_kx_handle = 0;
+static uint16_t g_enabled_handle = 0;
 
 // Per-connection application-layer crypto session. Reset on disconnect by
 // config_service.cpp so the next central re-runs the X25519 handshake.
@@ -99,6 +108,7 @@ std::array<uint8_t, 2> compute_status_locked()
     if (!g_active.wifi_ssid.empty()) flags |= 0x01;
     if (!g_active.wifi_password.empty()) flags |= 0x02;
     if (!g_active.openai_api_key.empty()) flags |= 0x04;
+    if (g_active.openai_enabled) flags |= 0x08;
     return {flags, g_wifi_connected ? uint8_t{1} : uint8_t{0}};
 }
 
@@ -158,6 +168,17 @@ static int gatt_access_cb(uint16_t /*conn_handle*/, uint16_t attr_handle,
             }
             auto st = compute_status_locked();
             const bool ok = append_encrypted(ctxt->om, {st.data(), st.size()});
+            xSemaphoreGive(g_mutex);
+            return ok ? 0 : BLE_ATT_ERR_UNLIKELY;
+        }
+        if (attr_handle == g_enabled_handle) {
+            xSemaphoreTake(g_mutex, portMAX_DELAY);
+            if (!g_session.is_established()) {
+                xSemaphoreGive(g_mutex);
+                return BLE_ATT_ERR_UNLIKELY;
+            }
+            const std::uint8_t byte = g_active.openai_enabled ? 1 : 0;
+            const bool ok = append_encrypted(ctxt->om, {&byte, 1});
             xSemaphoreGive(g_mutex);
             return ok ? 0 : BLE_ATT_ERR_UNLIKELY;
         }
@@ -229,6 +250,13 @@ static int gatt_access_cb(uint16_t /*conn_handle*/, uint16_t attr_handle,
             xSemaphoreGive(g_mutex);
             return 0;
         }
+        if (attr_handle == g_enabled_handle) {
+            if (pt.size() != 1) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+            xSemaphoreTake(g_mutex, portMAX_DELAY);
+            g_staging.openai_enabled = (pt[0] != 0);
+            xSemaphoreGive(g_mutex);
+            return 0;
+        }
         if (attr_handle == g_apply_handle) {
             if (pt.empty()) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
 
@@ -237,6 +265,7 @@ static int gatt_access_cb(uint16_t /*conn_handle*/, uint16_t attr_handle,
             if (g_staging.ssid) merged.wifi_ssid = *g_staging.ssid;
             if (g_staging.password) merged.wifi_password = *g_staging.password;
             if (g_staging.api_key) merged.openai_api_key = *g_staging.api_key;
+            if (g_staging.openai_enabled) merged.openai_enabled = *g_staging.openai_enabled;
             xSemaphoreGive(g_mutex);
 
             auto result = store::save(merged);
@@ -309,6 +338,12 @@ static ble_gatt_chr_def kChrs[] = {
         .access_cb = gatt_access_cb,
         .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
         .val_handle = &g_status_handle,
+    },
+    {
+        .uuid = &kOpenAiEnabledUuid.u,
+        .access_cb = gatt_access_cb,
+        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE,
+        .val_handle = &g_enabled_handle,
     },
     {} // terminator: uuid = nullptr
 };
