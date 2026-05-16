@@ -248,7 +248,14 @@ static int gatt_access_cb(uint16_t /*conn_handle*/, uint16_t attr_handle,
         // (kMaxJttsConfigBytes = 768) is currently the biggest; encrypted on
         // the wire adds 12 (nonce) + 16 (tag) bytes. NimBLE's prepared write
         // reassembly flattens long writes into this single mbuf chain.
-        std::array<std::uint8_t, 1024> buf{};
+        //
+        // Static rather than on-stack: at 1 KiB it ate a quarter of the
+        // NimBLE host task's 4 KiB stack, and OTA writes (cJSON parse +
+        // SPI-flash work below) tipped it into a stack-overflow panic
+        // ("A stack overflow in task nimble_host"). All GATT access cbs
+        // run on the single NimBLE host task — no reentrancy, so a shared
+        // static buffer is safe.
+        static std::array<std::uint8_t, 1024> buf;
         uint16_t out_len = 0;
         int rc = ble_hs_mbuf_to_flat(ctxt->om, buf.data(),
                                       static_cast<uint16_t>(buf.size()), &out_len);

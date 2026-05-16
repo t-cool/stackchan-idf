@@ -41,3 +41,10 @@ CONFIG_BT_NIMBLE_NVS_PERSIST=y
 # Required for components/config_service/crypto.cpp (X25519 + AES-256-GCM
 # application-layer encryption). HKDF is off by default in IDF's mbedtls.
 CONFIG_MBEDTLS_HKDF_C=y
+
+# OTA over BLE pushes 512B chunks through cJSON parsing + esp_ota_write +
+# SPI-flash drivers on the NimBLE host task. The 4 KiB default leaves no
+# headroom and overflowed once chunked writes started landing. 8 KiB matches
+# what the bleprph OTA examples use and gives a comfortable margin.
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=8192
+CONFIG_BT_NIMBLE_TASK_STACK_SIZE=8192
