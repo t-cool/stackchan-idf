@@ -212,6 +212,23 @@ private:
         }
     }
 
+    // Discard whatever's in the event queue without handling. Used by the
+    // recovery path to drop stale events emitted by the WebSocket client we
+    // just shut down — otherwise the freshly-connected new client gets
+    // immediately knocked over by a left-over DISCONNECTED from the old one.
+    void flush_events()
+    {
+        conv::ConversationEvent* ev = nullptr;
+        std::size_t dropped = 0;
+        while (xQueueReceive(event_queue_, &ev, 0) == pdTRUE) {
+            delete ev;
+            ++dropped;
+        }
+        if (dropped > 0) {
+            ESP_LOGD(kTag, "flushed %u stale events", static_cast<unsigned>(dropped));
+        }
+    }
+
     // ---- session lifecycle -------------------------------------------------
 
     bool connect()
@@ -245,12 +262,20 @@ private:
         }
         state_.mouth_open.store(0.0f, std::memory_order_relaxed);
         client_->stop();
+        // The shutdown fires WEBSOCKET_EVENT_DISCONNECTED (and sometimes a
+        // trailing ERROR) which the trampoline turns into transport-error
+        // events. We sit out the WS task's teardown, then flush the queue —
+        // otherwise the next drain_events() picks up that disconnect and
+        // treats it as a fresh failure of the new client, looping us back
+        // into recovery.
         vTaskDelay(pdMS_TO_TICKS(2000));
+        flush_events();
         assistant_pcm_.clear();
         assistant_text_.clear();
         if (!connect()) {
             ESP_LOGE(kTag, "reconnect failed; retrying in 5 s");
             vTaskDelay(pdMS_TO_TICKS(5000));
+            flush_events();
             connect();
         }
     }
