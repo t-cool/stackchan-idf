@@ -40,6 +40,7 @@ constexpr const char* kTag = "cfg-gatt";
 // Apply:   e3f0a004-...  Status: e3f0a005-...  KeyExchange: e3f0a006-...
 // OpenAiEnabled: e3f0a007-...  JttsConfig: e3f0a008-...
 // OtaControl: e3f0a009-...  OtaData: e3f0a00a-...
+// Provider: e3f0a00b-...  GeminiApiKey: e3f0a00c-...
 
 static const ble_uuid128_t kSvcUuid = BLE_UUID128_INIT(
     0x00, 0x1f, 0x4b, 0x8d, 0x5a, 0x2c, 0x6f, 0x9e,
@@ -86,13 +87,24 @@ static const ble_uuid128_t kOtaControlUuid = BLE_UUID128_INIT(
 static const ble_uuid128_t kOtaDataUuid = BLE_UUID128_INIT(
     0x00, 0x1f, 0x4b, 0x8d, 0x5a, 0x2c, 0x6f, 0x9e,
     0x2a, 0x4d, 0x1c, 0x7b, 0x0a, 0xa0, 0xf0, 0xe3);
+// Provider — encrypted 1-byte enum (0=OpenAI, 1=Gemini). Selects which
+// realtime conversation backend the conversation task talks to at boot.
+static const ble_uuid128_t kProviderUuid = BLE_UUID128_INIT(
+    0x00, 0x1f, 0x4b, 0x8d, 0x5a, 0x2c, 0x6f, 0x9e,
+    0x2a, 0x4d, 0x1c, 0x7b, 0x0b, 0xa0, 0xf0, 0xe3);
+// GeminiApiKey — encrypted string, paired with kKeyApiKey for OpenAI. Stored
+// separately so users can configure both providers and flip between them.
+static const ble_uuid128_t kGeminiApiKeyUuid = BLE_UUID128_INIT(
+    0x00, 0x1f, 0x4b, 0x8d, 0x5a, 0x2c, 0x6f, 0x9e,
+    0x2a, 0x4d, 0x1c, 0x7b, 0x0c, 0xa0, 0xf0, 0xe3);
 
 // --- Mutable state guarded by g_mutex ---
 static SemaphoreHandle_t g_mutex = nullptr;
 
 struct StagingBuffer {
-    std::optional<std::string> ssid, password, api_key, jtts_config;
+    std::optional<std::string> ssid, password, api_key, jtts_config, gemini_api_key;
     std::optional<bool> openai_enabled;
+    std::optional<Provider> provider;
 };
 
 static DeviceConfig g_active;
@@ -112,6 +124,8 @@ static uint16_t g_enabled_handle = 0;
 static uint16_t g_jtts_handle = 0;
 static uint16_t g_ota_ctrl_handle = 0;
 static uint16_t g_ota_data_handle = 0;
+static uint16_t g_provider_handle = 0;
+static uint16_t g_gemini_key_handle = 0;
 
 // Largest plaintext payload we accept on a single write — chosen to fit the
 // jtts config JSON comfortably. The encrypted wire form adds 12 (nonce) + 16
@@ -141,6 +155,8 @@ std::array<uint8_t, 2> compute_status_locked()
     if (!g_active.wifi_password.empty()) flags |= 0x02;
     if (!g_active.openai_api_key.empty()) flags |= 0x04;
     if (g_active.openai_enabled) flags |= 0x08;
+    if (!g_active.gemini_api_key.empty()) flags |= 0x10;
+    if (g_active.provider == Provider::Gemini) flags |= 0x20;
     return {flags, g_wifi_connected ? uint8_t{1} : uint8_t{0}};
 }
 
@@ -237,6 +253,17 @@ static int gatt_access_cb(uint16_t /*conn_handle*/, uint16_t attr_handle,
             const bool ok = append_encrypted(
                 ctxt->om,
                 {reinterpret_cast<const std::uint8_t*>(json.data()), json.size()});
+            xSemaphoreGive(g_mutex);
+            return ok ? 0 : BLE_ATT_ERR_UNLIKELY;
+        }
+        if (attr_handle == g_provider_handle) {
+            xSemaphoreTake(g_mutex, portMAX_DELAY);
+            if (!g_session.is_established()) {
+                xSemaphoreGive(g_mutex);
+                return BLE_ATT_ERR_UNLIKELY;
+            }
+            const std::uint8_t byte = static_cast<std::uint8_t>(g_active.provider);
+            const bool ok = append_encrypted(ctxt->om, {&byte, 1});
             xSemaphoreGive(g_mutex);
             return ok ? 0 : BLE_ATT_ERR_UNLIKELY;
         }
@@ -345,6 +372,23 @@ static int gatt_access_cb(uint16_t /*conn_handle*/, uint16_t attr_handle,
             (void)ota::handle_data_chunk({pt.data(), pt.size()});
             return 0;
         }
+        if (attr_handle == g_provider_handle) {
+            if (pt.size() != 1) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+            const Provider p = (pt[0] == static_cast<std::uint8_t>(Provider::Gemini))
+                                   ? Provider::Gemini : Provider::OpenAi;
+            xSemaphoreTake(g_mutex, portMAX_DELAY);
+            g_staging.provider = p;
+            xSemaphoreGive(g_mutex);
+            return 0;
+        }
+        if (attr_handle == g_gemini_key_handle) {
+            if (pt.size() > 256) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+            std::string val(reinterpret_cast<const char*>(pt.data()), pt.size());
+            xSemaphoreTake(g_mutex, portMAX_DELAY);
+            g_staging.gemini_api_key = std::move(val);
+            xSemaphoreGive(g_mutex);
+            return 0;
+        }
         if (attr_handle == g_apply_handle) {
             if (pt.empty()) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
 
@@ -355,6 +399,8 @@ static int gatt_access_cb(uint16_t /*conn_handle*/, uint16_t attr_handle,
             if (g_staging.api_key) merged.openai_api_key = *g_staging.api_key;
             if (g_staging.openai_enabled) merged.openai_enabled = *g_staging.openai_enabled;
             if (g_staging.jtts_config) merged.jtts_config_json = *g_staging.jtts_config;
+            if (g_staging.gemini_api_key) merged.gemini_api_key = *g_staging.gemini_api_key;
+            if (g_staging.provider) merged.provider = *g_staging.provider;
             xSemaphoreGive(g_mutex);
 
             auto result = store::save(merged);
@@ -451,6 +497,18 @@ static ble_gatt_chr_def kChrs[] = {
         .access_cb = gatt_access_cb,
         .flags = BLE_GATT_CHR_F_WRITE,
         .val_handle = &g_ota_data_handle,
+    },
+    {
+        .uuid = &kProviderUuid.u,
+        .access_cb = gatt_access_cb,
+        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE,
+        .val_handle = &g_provider_handle,
+    },
+    {
+        .uuid = &kGeminiApiKeyUuid.u,
+        .access_cb = gatt_access_cb,
+        .flags = BLE_GATT_CHR_F_WRITE,
+        .val_handle = &g_gemini_key_handle,
     },
     {} // terminator: uuid = nullptr
 };

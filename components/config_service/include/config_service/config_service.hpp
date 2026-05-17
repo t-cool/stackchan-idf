@@ -3,15 +3,25 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <tl/expected.hpp>
 
 namespace stackchan::config {
 
+// Realtime conversation backend. Selects which provider's WebSocket the
+// conversation task talks to, and which API key it picks up at boot.
+enum class Provider : std::uint8_t {
+    OpenAi = 0,   // OpenAI Realtime API (wss://api.openai.com/v1/realtime)
+    Gemini = 1,   // Google Gemini Live API (wss://generativelanguage.googleapis.com/...)
+};
+
 struct DeviceConfig {
     std::string wifi_ssid;
     std::string wifi_password;
     std::string openai_api_key;
+    std::string gemini_api_key;
+    Provider provider = Provider::OpenAi;
     // Master switch for the OpenAI Realtime conversation task. Independent
     // of openai_api_key so the key can stay persisted while the feature is
     // turned off (saves data, lets the user take Stack-chan offline without

@@ -67,7 +67,7 @@
     margin-bottom: 0.3rem;
     margin-top: 1rem;
   }
-  input[type=text], input[type=password] {
+  input[type=text], input[type=password], select#provider {
     width: 100%;
     padding: 0.5rem 0.75rem;
     border: 1px solid #ccc;
@@ -75,8 +75,9 @@
     font-size: 0.95rem;
     outline: none;
     transition: border-color 0.2s;
+    background: white;
   }
-  input:focus { border-color: #2196f3; }
+  input:focus, select#provider:focus { border-color: #2196f3; }
   .hint { font-size: 0.78rem; color: #888; margin-top: 0.2rem; }
   .toggle-label {
     display: flex;
@@ -247,8 +248,10 @@
     <span class="flags">
       <span class="flag" id="flag-ssid" title="SSID 設定済み">S</span>
       <span class="flag" id="flag-pass" title="Password 設定済み">P</span>
-      <span class="flag" id="flag-key"  title="API key 設定済み">K</span>
+      <span class="flag" id="flag-key"  title="OpenAI key 設定済み">K</span>
       <span class="flag" id="flag-en"   title="OpenAI 有効">O</span>
+      <span class="flag" id="flag-gkey" title="Gemini key 設定済み">G</span>
+      <span class="flag" id="flag-prov" title="Provider = Gemini">P</span>
     </span>
   </div>
 
@@ -267,12 +270,22 @@
   <label for="password">Wi-Fi パスワード</label>
   <input type="password" id="password" maxlength="64" placeholder="（変更しない場合は空欄）">
 
+  <label for="provider">会話プロバイダ</label>
+  <select id="provider">
+    <option value="0">OpenAI Realtime</option>
+    <option value="1">Google Gemini Live</option>
+  </select>
+  <p class="hint">どちらの API を使うかを切り替えます。キーは下記の両方に保存できます。</p>
+
   <label for="apikey">OpenAI API キー</label>
   <input type="password" id="apikey" maxlength="256" placeholder="sk-… （変更しない場合は空欄）">
 
+  <label for="gemini-apikey">Gemini API キー</label>
+  <input type="password" id="gemini-apikey" maxlength="256" placeholder="AIza… （変更しない場合は空欄）">
+
   <label class="toggle-label" for="openai-enabled" style="margin-top:1rem">
     <input type="checkbox" id="openai-enabled" checked>
-    <span>OpenAI 会話機能を有効にする</span>
+    <span>会話機能を有効にする</span>
   </label>
   <p class="hint">オフにすると API キーは残したまま会話タスクを起動しません</p>
 
@@ -366,6 +379,8 @@ const CHR_EN      = 'e3f0a007-7b1c-4d2a-9e6f-2c5a8d4b1f00';
 const CHR_JTTS    = 'e3f0a008-7b1c-4d2a-9e6f-2c5a8d4b1f00';
 const CHR_OTA_CTRL = 'e3f0a009-7b1c-4d2a-9e6f-2c5a8d4b1f00';
 const CHR_OTA_DATA = 'e3f0a00a-7b1c-4d2a-9e6f-2c5a8d4b1f00';
+const CHR_PROVIDER = 'e3f0a00b-7b1c-4d2a-9e6f-2c5a8d4b1f00';
+const CHR_GEMINI_KEY = 'e3f0a00c-7b1c-4d2a-9e6f-2c5a8d4b1f00';
 
 // OTA transfer parameters. 512B plaintext chunks fit comfortably in the
 // firmware's 1024-byte access-callback scratch buffer (after 28B of AES-GCM
@@ -386,7 +401,7 @@ const DIS_CHRS = {
 
 // --- State ---
 let bleDevice = null, bleServer = null, svc = null;
-let chrSsid = null, chrPass = null, chrKey = null, chrApply = null, chrStatus = null, chrKx = null, chrEn = null, chrJtts = null, chrOtaCtrl = null, chrOtaData = null;
+let chrSsid = null, chrPass = null, chrKey = null, chrApply = null, chrStatus = null, chrKx = null, chrEn = null, chrJtts = null, chrOtaCtrl = null, chrOtaData = null, chrProvider = null, chrGeminiKey = null;
 let jttsInitialJson = '';  // last read JSON, used to detect Apply-time changes
 let otaInFlight = false;
 let aesKey = null;  // CryptoKey for AES-256-GCM, derived per connection
@@ -423,6 +438,8 @@ function updateStatus(data) {
   document.getElementById('flag-pass').classList.toggle('set', !!(flags & 0x02));
   document.getElementById('flag-key' ).classList.toggle('set', !!(flags & 0x04));
   document.getElementById('flag-en'  ).classList.toggle('set', !!(flags & 0x08));
+  document.getElementById('flag-gkey').classList.toggle('set', !!(flags & 0x10));
+  document.getElementById('flag-prov').classList.toggle('set', !!(flags & 0x20));
   const wifiDot = document.getElementById('wifi-dot');
   wifiDot.className = 'dot ' + (wifi ? 'wifi-connected' : '');
   document.getElementById('wifi-label').textContent = wifi ? 'Wi-Fi: 接続中' : 'Wi-Fi: 切断中';
@@ -732,7 +749,7 @@ document.getElementById('btn-connect').addEventListener('click', async () => {
     log('GATT 接続完了', 'ok');
 
     svc = await bleServer.getPrimaryService(SVC_UUID);
-    [chrSsid, chrPass, chrKey, chrApply, chrStatus, chrKx, chrEn, chrJtts, chrOtaCtrl, chrOtaData] = await Promise.all([
+    [chrSsid, chrPass, chrKey, chrApply, chrStatus, chrKx, chrEn, chrJtts, chrOtaCtrl, chrOtaData, chrProvider, chrGeminiKey] = await Promise.all([
       svc.getCharacteristic(CHR_SSID),
       svc.getCharacteristic(CHR_PASS),
       svc.getCharacteristic(CHR_KEY),
@@ -743,6 +760,8 @@ document.getElementById('btn-connect').addEventListener('click', async () => {
       svc.getCharacteristic(CHR_JTTS),
       svc.getCharacteristic(CHR_OTA_CTRL),
       svc.getCharacteristic(CHR_OTA_DATA),
+      svc.getCharacteristic(CHR_PROVIDER),
+      svc.getCharacteristic(CHR_GEMINI_KEY),
     ]);
     log('Characteristics 取得完了', 'ok');
 
@@ -780,9 +799,20 @@ document.getElementById('btn-connect').addEventListener('click', async () => {
       const enabled = enBytes.length > 0 && enBytes[0] !== 0;
       document.getElementById('openai-enabled').checked = enabled;
       document.getElementById('openai-enabled').dataset.initial = enabled ? '1' : '0';
-      log(`OpenAI 会話機能: ${enabled ? '有効' : '無効'}`);
+      log(`会話機能: ${enabled ? '有効' : '無効'}`);
     } catch (e) {
-      log(`OpenAI 有効状態の取得失敗: ${e.message}`, 'err');
+      log(`有効状態の取得失敗: ${e.message}`, 'err');
+    }
+
+    try {
+      const provBytes = await readEncrypted(chrProvider);
+      const provider = provBytes.length > 0 ? provBytes[0] : 0;
+      const sel = document.getElementById('provider');
+      sel.value = String(provider);
+      sel.dataset.initial = String(provider);
+      log(`プロバイダ: ${provider === 1 ? 'Gemini Live' : 'OpenAI Realtime'}`);
+    } catch (e) {
+      log(`プロバイダ取得失敗: ${e.message}`, 'err');
     }
 
     try {
@@ -830,10 +860,11 @@ document.getElementById('btn-connect').addEventListener('click', async () => {
 function onDisconnected() {
   log('切断されました', 'err');
   setBleUi(false);
-  chrSsid = chrPass = chrKey = chrApply = chrStatus = chrKx = chrEn = chrJtts = chrOtaCtrl = chrOtaData = null;
+  chrSsid = chrPass = chrKey = chrApply = chrStatus = chrKx = chrEn = chrJtts = chrOtaCtrl = chrOtaData = chrProvider = chrGeminiKey = null;
   aesKey = null;
   clearDeviceInfo();
   delete document.getElementById('openai-enabled').dataset.initial;
+  delete document.getElementById('provider').dataset.initial;
   jttsInitialJson = '';
   writeJttsForm('');
   document.getElementById('btn-ota').disabled = true;
@@ -856,6 +887,7 @@ document.getElementById('btn-apply').addEventListener('click', async () => {
   const ssid = document.getElementById('ssid').value.trim();
   const pass = document.getElementById('password').value;
   const key  = document.getElementById('apikey').value.trim();
+  const gkey = document.getElementById('gemini-apikey').value.trim();
 
   const btn = document.getElementById('btn-apply');
   btn.disabled = true;
@@ -874,7 +906,18 @@ document.getElementById('btn-apply').addEventListener('click', async () => {
     }
     if (key) {
       await writeEncrypted(chrKey, strToBytes(key));
-      log('API キー 書き込み完了', 'ok');
+      log('OpenAI キー 書き込み完了', 'ok');
+    }
+    if (gkey) {
+      await writeEncrypted(chrGeminiKey, strToBytes(gkey));
+      log('Gemini キー 書き込み完了', 'ok');
+    }
+
+    // Provider: only write if changed from initial.
+    const provSel = document.getElementById('provider');
+    if (provSel.dataset.initial !== undefined && provSel.value !== provSel.dataset.initial) {
+      await writeEncrypted(chrProvider, new Uint8Array([Number(provSel.value)]));
+      log(`プロバイダを ${provSel.options[provSel.selectedIndex].text} に切替`, 'ok');
     }
 
     // Only push the enable flag if it changed from what we read at connect.
